@@ -1,0 +1,12 @@
+# 机密：含 API Key，切勿提交
+.env
+data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+tools/out/
+.DS_Store
+
+# 临时备份（含密钥，切勿提交）
+*.bak-*

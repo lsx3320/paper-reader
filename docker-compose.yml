@@ -1,0 +1,22 @@
+services:
+  paper-reader:
+    build:
+      context: .
+      # 国内网络可取消注释，用镜像源加速 pip
+      # args:
+      #   PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    image: paper-reader:latest
+    container_name: paper-reader
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    # Linux 上访问宿主机上的本地模型服务（macOS/Windows 自带，加了也无害）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

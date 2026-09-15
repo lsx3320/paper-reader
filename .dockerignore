@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+tools/out/
