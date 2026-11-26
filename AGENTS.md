@@ -8,7 +8,7 @@
 - 线上：https://paper.lushixiao.cn（Cloudflare 代理 + nginx Basic Auth）。
 - 生产机：VPS 23.27.0.190，代码 `/opt/paper-reader`，数据 `/opt/paper-reader-data`。
 - 本地开发：`docker compose up -d --build` → http://localhost:8010；`make test` 自检。
-- 发布：本地验证 → 备份 → 同步到 VPS（保留 VPS 的 `.env`）→ `docker compose up -d` → 跑《AGENT_ONBOARDING.md》第 8.2 节验证清单。
+- 发布：本地验证 → `./scripts/deploy.sh --dry-run` → `./scripts/deploy.sh`。脚本不覆盖 VPS 的 `.env`，在 VPS（amd64）上构建，失败自动回滚。不要把 Mac（arm64）镜像拷过去。细则见 `AGENT_ONBOARDING.md` 第 8.4 节。
 
 ## 红线（违反即回滚）
 

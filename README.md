@@ -36,6 +36,34 @@ docker compose up -d --build    # 改代码后重建
 
 > 国内网络若 pip 拉取慢，取消 `docker-compose.yml` 中 `PIP_INDEX_URL` 的注释改用清华源。
 
+## 生产部署
+
+线上在 VPS（amd64）的 `/opt/paper-reader`，数据在 `/opt/paper-reader-data`。开发机若是 Mac（arm64），**只同步源码，在 VPS 上 `docker compose build`**，不要把本机镜像拷过去。
+
+仓库不含生产 `.env`。VPS 上那份不要覆盖，里面有密钥，以及 `HOST_PORT=127.0.0.1:18010`、`DATA_HOST_DIR=/opt/paper-reader-data`。
+
+```bash
+./scripts/deploy.sh --dry-run     # 只打印步骤，不连接、不改文件、不碰 .env
+./scripts/deploy.sh --self-test   # 本机检查 SQLite backup API 和 .env 保护，不接触 VPS
+./scripts/deploy.sh               # 备份 → 同步（排除 .env）→ 在 VPS 上构建并启动 → 健康检查
+```
+
+健康检查打的是 VPS 本机 `http://127.0.0.1:18010/api/health`。失败时自动换回上一份代码和 `paper-reader:prev`；只有新容器已经启动过，才用启动前的备份恢复数据库。脚本不碰 sing-box、代理端口（443/udp、8443/tcp、2083/tcp）、proxy-sub、ufw、证书和 Cloudflare。
+
+回滚细节见 `AGENT_ONBOARDING.md` 第 8.4 节。
+
+新环境先把归档代码在本地跑起来即可，不必连生产机。没有 API Key 时打开模拟模式：
+
+```bash
+git clone https://github.com/lsx3320/paper-reader.git
+cd paper-reader
+cp .env.example .env          # 把 LLM_MOCK=1 写进去
+docker compose up -d --build
+curl -s http://127.0.0.1:8000/api/health
+```
+
+`.env.example` 里 `HOST_PORT` 默认 8000。生产端口只存在于 VPS 的 `.env`。
+
 ## 不用 Docker（本地跑）
 
 ```bash
@@ -401,6 +429,7 @@ paper-reader/
 │   ├── config.py       环境变量配置与内置术语表
 │   └── static/         极简阅读器前端（原生 JS，无构建步骤）
 ├── tools/              样例论文生成 + 切片自检
+├── scripts/deploy.sh   生产发布（--dry-run、备份、不覆盖 .env、失败回滚）
 ├── Dockerfile / docker-compose.yml / .env.example
 └── data/               运行时数据（PDF、SQLite），已挂载为卷
 ```

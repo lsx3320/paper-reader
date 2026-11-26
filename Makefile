@@ -1,7 +1,7 @@
 # 便捷命令：make up / make logs / make test ...
 IMAGE ?= paper-reader:latest
 
-.PHONY: help up build down logs restart sample test shell clean llm-up llm-down llm-status use-local use-cloud
+.PHONY: help up build down logs restart sample test shell clean llm-up llm-down llm-status use-local use-cloud deploy-dry deploy
 
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s $$'\t'
@@ -46,6 +46,12 @@ llm-status: ## 查看本地模型状态与内存占用
 
 use-local: ## 切换为本地模型（Ollama + Qwen3-1.7B）
 	@cp .env.local-llm.example .env && docker compose up -d --force-recreate >/dev/null && echo "已切换为本地模型，见 http://localhost:$$(grep -oE '[0-9]+' <<< $$(grep HOST_PORT .env | cut -d= -f2))"
+
+deploy-dry: ## 预演生产部署（不连接、不修改、不碰 .env）
+	./scripts/deploy.sh --dry-run
+
+deploy: ## 部署到生产 VPS（在 VPS 上构建；不覆盖 .env）
+	./scripts/deploy.sh
 
 use-cloud: ## 切换为云端 DeepSeek
 	@cp .env.cloud.example .env && echo "已切到云端配置，请把 LLM_API_KEY 填进 .env 后执行：docker compose up -d --force-recreate"

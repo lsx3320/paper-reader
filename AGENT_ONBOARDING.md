@@ -13,7 +13,7 @@
 - **技术栈**：Python 3.11 / FastAPI / uvicorn / PyMuPDF / httpx；原生 JS 前端（无构建）；SQLite（WAL）；Docker；nginx；Cloudflare 代理；Let's Encrypt。
 - **线上状态**：已部署在海外 VPS（香港），**https://paper.lushixiao.cn**，nginx Basic Auth 保护，两个共享账号（`paper`、`guest`），每日 04:17 自动备份数据库。
 - **代码规模**：后端约 12k 行 Python + 前端约 4 万字符 JS，结构扁平、可读性好。
-- **当前主要短板**：单书库多人共享、Basic Auth 无用户体系、无自动化测试/CI、无成本配额、代码仓库落后于线上版本。
+- **当前主要短板**：单书库多人共享、Basic Auth 无用户体系、无自动化测试/CI、无成本配额。2026-11-26 的代码已归档进公开仓库，发布用 `scripts/deploy.sh`。
 - **接手建议顺序**：读 README → 读本文 → 本地跑起来 → 复现问题 → 领任务（第 12 节）→ 小步改 + 验证 → 发布（第 8 节）。
 - **三件事不能碰**：① 同机代理服务（sing-box）；② 证书/Cloudflare 配置（除非任务明确要求）；③ 生产数据库（改前必须备份）。
 
@@ -136,12 +136,12 @@ paper-reader/
 │   ├── tts.py              # 小米 MiMo TTS：分段合成、磁盘缓存、探测
 │   ├── config.py           # 环境变量解析（ALL CAPS 常量）
 │   └── static/             # 前端（无构建）：index.html + app.js(41KB) + style.css
+├── scripts/deploy.sh            # 生产发布：备份、同步（排除 .env）、VPS 上构建、失败回滚
 ├── scripts/serve_local_llm.sh   # 可选：本地 Ollama 小模型（Mac 专用，生产不用）
 └── tools/                  # make_sample_pdf.py、smoke_test.py、样例 PDF
 ```
 
-**Git**：本地目录带 `.git`，远端 `https://github.com/lsx3320/paper-reader.git`（公开仓库，**最后推送 2026-09-15**）。
-⚠️ 当前本地/线上代码包含 2026 年 9 月下旬～10 月上旬的改动，**比远端仓库新**；接手时必须以本站部署版本为基线，并建议先做一次代码归档/推送（见 12 节 P0-7）。
+**Git**：远端 `https://github.com/lsx3320/paper-reader.git`（**公开仓库**，维护者已确认继续公开）。2026-11-26 已把当时的本地/生产代码归档进仓库；在此之前 GitHub 停在 2026-09-15 的 `ff3dd9a`。合并到 master 后建议打附注标签 `archive-2026-11-26`（指向归档提交）。生产机上的 `.env` 从未入库。
 
 ---
 
@@ -261,22 +261,24 @@ docker compose down               # 停止
 
 ---
 
-## 8. 部署与发布流程（当前 + 建议改进）
+## 8. 部署与发布流程
 
-### 8.1 当前流程（手工）
+支持的发布方式是在操作者本机执行 `scripts/deploy.sh`（见 8.4）。8.1 是它在服务器上做的事，方便对照日志；不要再手工把整个目录 rsync 上去。
 
-1. 在本地仓库改代码，本地验证（第 7 节）。
-2. 备份：数据库 + 代码目录（见 9.3）。
-3. 把改动同步到 VPS（SFTP/rsync；**不要覆盖 VPS 的 `.env`**，它含生产密钥和端口映射）。
-4. 在 VPS 构建并重启：
+### 8.1 脚本在服务器上对应的动作
+
+1. 操作者先在本地改代码并验证（第 7 节），再执行 `scripts/deploy.sh`。
+2. 用 SQLite backup API 备份数据库，并把当前代码、镜像留成 `/opt/paper-reader.prev` 和 `paper-reader:prev`。
+3. rsync 源码到 `/opt/paper-reader`，排除 `.env`（生产密钥和 `HOST_PORT` / `DATA_HOST_DIR` 留在 VPS 上）。
+4. 在 VPS 上构建并换上新容器（本机是 arm64 时也不能改成在本地构建）：
    ```bash
    cd /opt/paper-reader
    docker compose build
    docker compose up -d
    docker compose ps            # healthy
    ```
-5. 跑验证清单（8.2）。
-6. 记录变更（建议写入 `CHANGELOG.md`）。
+5. 脚本先请求 `http://127.0.0.1:18010/api/health`。通过后人工再跑第 8.2 节清单。
+6. 把值得留下的变更写进本文第 15 节变更记录。
 
 ### 8.2 发布后验证清单（每次必做）
 
@@ -291,18 +293,60 @@ docker compose down               # 停止
 
 ### 8.3 回滚
 
-- 代码：保留上一份 `/opt/paper-reader` 目录副本（如 `/opt/paper-reader.prev/`），出问题整目录换回并重建。
+`scripts/deploy.sh` 在失败时会自动做前两步；新容器已经启动过时，还会用启动前那份 SQLite backup API 快照恢复数据库（见 8.4）。需要人工再滚一次时：
+
+- 代码：保留上一份 `/opt/paper-reader` 目录副本（如 `/opt/paper-reader.prev/`），出问题整目录换回并重建。`.env` 不要用别的文件覆盖。
 - 镜像：`docker tag paper-reader:latest paper-reader:prev`（发布前打标签），回滚时 `docker tag paper-reader:prev paper-reader:latest` 再 `up -d`。
 - 数据：用 `/opt/paper-reader-data/backups/paper_reader-*.db` 恢复（停容器 → 替换 → 启动）。
 - 兜底：本地 Mac 上仍保留一份可运行的数据/代码。
 
-### 8.4 建议改进（P0-7）
+### 8.4 一键部署（`scripts/deploy.sh`）
 
-建立 Git 工作流 + 一键部署脚本：
+在操作者本机执行（通常是 Mac，arm64）。脚本只同步源码，**在 VPS（amd64）上 `docker compose build`**，从不把本机镜像拷到 VPS。
+
 ```bash
-# 示例（待实现）
-./scripts/deploy.sh  # 本地推代码 → VPS 备份 → build → health 检查 → 失败自动回滚
+./scripts/deploy.sh --dry-run    # 只打印步骤。不 SSH、不改任何文件，也不读/写 .env
+./scripts/deploy.sh --self-test  # 本机自检：WAL 上的 backup API、.env 被改动能恢复、rsync 排除 .env
+./scripts/deploy.sh              # 正式部署
+./scripts/deploy.sh --host root@23.27.0.190
 ```
+
+可选环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PAPER_READER_SSH` | `root@23.27.0.190` | SSH 目标 |
+| `PAPER_READER_REMOTE_DIR` | `/opt/paper-reader` | 代码目录 |
+| `PAPER_READER_DATA_DIR` | `/opt/paper-reader-data` | 数据目录 |
+| `PAPER_READER_HEALTH_URL` | `http://127.0.0.1:18010/api/health` | 只在 VPS 本机检查，不走 nginx / Cloudflare |
+| `PAPER_READER_ALLOW_NO_DB` | 不设 | 设为 `1` 才允许数据目录里没有 `paper_reader.db` |
+
+脚本保证：
+
+1. **不覆盖** VPS 的 `.env`（生产密钥、`HOST_PORT=127.0.0.1:18010`、`DATA_HOST_DIR=/opt/paper-reader-data` 留在服务器上）。rsync 排除 `.env`，同步前用 `rsync -ani` 预检，同步后再对 sha256 做一次校验；不一致就从保留副本恢复并中止。
+2. 用 **SQLite backup API** 备份 `paper_reader.db`（python `Connection.backup()`，或 `sqlite3 .backup`）。不 `cp` 正在使用的主库 / `-wal` / `-shm`。构建期间旧容器仍在服务，所以启动新容器前会再备一次；自动恢复用的是这一份（`paper_reader-deploy-<时间>-pre-up.db`）。
+3. 发布前把当前镜像打成 `paper-reader:prev`，代码复制到 `/opt/paper-reader.prev`。
+4. 在 VPS 上 `docker compose build`，然后 `docker compose up -d`。
+5. 轮询 `http://127.0.0.1:18010/api/health`，直到 JSON 里 `ok` 为 true。
+6. 失败自动回滚：
+   - 新容器还没起来（同步失败、构建失败、启动前备份失败）：只把代码和镜像标签换回，不重启仍在服务的旧容器，也不动数据库，避免丢掉构建期间旧版本的写入。
+   - 新容器已经尝试启动，或健康检查失败：`docker stop paper-reader`（只停这个容器），换回代码和 `paper-reader:prev`，用启动前那份快照恢复数据库并删掉残留的 `-wal`/`-shm`，再 `up -d --no-build`。失败的镜像会另标为 `paper-reader:failed-<时间>`。
+7. **不碰** sing-box、443/udp、8443/tcp、2083/tcp、proxy-sub、ufw 既有规则、证书、Cloudflare。
+
+新环境复现到「能本地跑」，不必登录生产机：
+
+```bash
+git clone https://github.com/lsx3320/paper-reader.git
+cd paper-reader
+cp .env.example .env
+# 没有 API Key：在 .env 里设 LLM_MOCK=1
+docker compose up -d --build
+curl -s http://127.0.0.1:8000/api/health
+./scripts/deploy.sh --self-test
+./scripts/deploy.sh --dry-run
+```
+
+生产发布不是 clone 之后的自动步骤。本次归档没有登录 VPS 执行部署。
 
 ---
 
@@ -381,12 +425,12 @@ systemctl list-timers | grep certbot  # 自动续期定时器
 | # | 问题 | 影响 | 备注 |
 |---|---|---|---|
 | 1 | SQLite 曾损坏（2026-11-26 已修复） | 翻译/推荐报 500 | 历史遗留（2026-09-20、10-08 亦有记录）；已加每日备份 |
-| 2 | 代码仓库落后线上版本 | Agent 拿不到最新代码 | GitHub 最后推送 2026-09-15；线上含 9 月下旬~10 月上旬改动 |
+| 2 | 代码仓库曾落后线上（2026-11-26 已归档） | 当时 Agent 拿不到最新代码 | 当日树已进入公开仓库；之后用 `scripts/deploy.sh` 发布，避免再分叉 |
 | 3 | 单书库、单租户 | 多人共享/互删 | 需要多租户改造 |
 | 4 | Basic Auth 无用户体系 | 无法按人管理/审计/限流 | 见优化 P0 |
 | 5 | CF 代理导致限速粒度失真 | 限速上限变成全局 | 需 nginx real_ip + CF-Connecting-IP |
 | 6 | 无任何自动化测试/CI | 改动风险高 | 只有 tools/smoke_test.py（切片自检） |
-| 7 | 无部署脚本 | 手工同步易漏/易错 | 见 8.4 |
+| 7 | 曾无部署脚本（2026-11-26 已补 `scripts/deploy.sh`） | 手工同步易漏/易错 | 见 8.4。`--dry-run` 不改机器；失败自动回滚 |
 | 8 | 「论文发现」偶发为空 | 体验不稳定 | 依赖 LLM 生成，失败时池空；可加降级/重试 |
 | 9 | 无成本配额/用量告警 | 可能超支 LLM/TTS | 可做 token 统计与额度 |
 | 10 | Docker 日志未限制大小 | 长期磁盘增长 | 建议 daemon.json log-opts |
@@ -409,7 +453,7 @@ systemctl list-timers | grep certbot  # 自动续期定时器
 | P0-4 | **数据库自检**：启动时 `PRAGMA integrity_check` 失败告警；WAL 定期 checkpoint；升级前自动备份 | 人为制造损坏可被检测并拒绝启动/告警；备份文件自动生成 |
 | P0-5 | **成本控制**：按用户统计 token/字符用量 + 月额度 + 超额拒绝；TTS 同理 | `/api/stats` 可按用户展示；超限返回明确错误 |
 | P0-6 | **密钥管理**：`.env` 轮换流程文档化；禁止密钥进入仓库/日志 | `git log -S` 无密钥；日志无密钥明文 |
-| P0-7 | **代码归档 + 部署脚本**：把线上版本推到 Git（建议私有仓库或确认公开范围）；`scripts/deploy.sh` 一键备份→构建→健康检查→失败回滚 | 新环境按文档可复现部署；部署失败自动回滚 |
+| P0-7 | **代码归档 + 部署脚本**（2026-11-26 已落地，仓库保持公开） | `scripts/deploy.sh` 支持 `--dry-run`、SQLite backup API、不覆盖 `.env`、只在 VPS 上构建、失败回滚。合并后建议给归档提交打附注标签 `archive-2026-11-26`。这次没有登录生产机发布 |
 
 ### P1（功能/体验/可观测）
 
@@ -465,7 +509,7 @@ make test
 - 每次只做一项，小步提交
 
 **第 5 步：改 + 验证**
-- 本地验证 → 备份 → 同步到 VPS → build → 第 8.2 清单
+- 本地验证 → `./scripts/deploy.sh`（自带备份、不覆盖 `.env`、失败回滚）→ 第 8.2 清单
 - 用可复现证据说话（curl 输出、日志、截图），不要只说「改好了」
 
 **第 6 步：收尾**
@@ -493,7 +537,7 @@ make test
    翻译一段、TTS 一段，全部通过后把结果贴给我；
 3) 从 AGENT_ONBOARDING.md 第 12 节路线图按 P0→P1 顺序选一项，先给我 3~5 行方案
   （改哪些文件、如何验证、如何回滚），我确认后你才动手；
-4) 每次改动必须：本地验证 → 备份 → 部署 → 跑第 8.2 验证清单 → 给我可复现证据；
+4) 每次改动必须：本地验证 → ./scripts/deploy.sh（自带备份、不覆盖 .env、失败回滚）→ 跑第 8.2 验证清单 → 给我可复现证据；
 5) 严禁：改动 sing-box/代理/证书/Cloudflare DNS、删除数据、把密钥写进代码或日志、
    未备份就动生产数据库。
 
@@ -539,6 +583,7 @@ tail -50 /var/log/nginx/paper-reader.access.log
 |---|---|
 | 丙午年孟冬之十七（2026-11-25） | 用户购入 VPS；由外部助手部署 sing-box 代理 + nginx 订阅（与本项目无关） |
 | 丙午年孟冬之十八（2026-11-26） | 项目从 Mac 迁移到 VPS（Docker）；配置 HTTPS、Cloudflare、Basic Auth、限速、每日备份；域名切换为 `paper.lushixiao.cn`；修复 SQLite 损坏；删除旧 Cloudflare Access 邮箱登录 |
+| 丙午年孟冬之十八（2026-11-26） | P0-7：把当日本地/生产代码归档进公开 GitHub；新增 `scripts/deploy.sh`（`--dry-run` / `--self-test`、SQLite backup API、不覆盖 VPS `.env`、只在 VPS 上构建、健康检查失败自动回滚）。未对生产机执行部署 |
 
 ### D. 名词表
 
