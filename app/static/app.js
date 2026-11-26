@@ -32,10 +32,6 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
-  if (res.status === 401 && !location.pathname.startsWith('/login')) {
-    location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
-    throw new Error('未登录');
-  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) { /* ignore */ }
@@ -414,7 +410,11 @@ async function speechUrl(idx) {
     if (!res.ok) {
       let msg = `合成失败 (${res.status})`;
       try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) { /* ignore */ }
-      throw new Error(msg);
+      const err = new Error(msg);
+      err.status = res.status;
+      // 503 = 账户级故障（余额不足 / Key 失效）：重试无用，调用方应停止整场朗读
+      err.fatal = res.status === 503;
+      throw err;
     }
     const url = URL.createObjectURL(await res.blob());
     player.urls.set(key, url);
@@ -641,6 +641,12 @@ async function playCurrent() {
     player.loadingSince = 0;
     stopLoadingTicker();
     if (node && node.zh) node.zh.classList.remove('synthesizing');
+    if (err.fatal) {
+      // 账户级故障：整场朗读再往下走只会逐段重复同一个错误，直接停下并给出唯一提示
+      stopSpeaking(true);
+      toast('语音服务不可用', err.message, '🔇', 12000);
+      return;
+    }
     toast(`第 ${idx + 1} 段合成失败，已跳过`, `${err.message}（可点该段 🔈 单独重试）`, '⚠️', 6000);
     player.pos += 1;
     playCurrent();
@@ -850,6 +856,78 @@ async function route() {
   loadLibrary();
 }
 
+/* ------------------------------------------------------------------ 论文发现 */
+/* 卡片内容全部来自第三方（模型输出），一律用 textContent 赋值，
+   不走 innerHTML —— 这样外部字符串即使含 HTML 也没有注入面。 */
+const pickState = { id: null, loading: false, retry: null, tries: 0 };
+
+function renderPick(pick) {
+  $('#pickCat').textContent = pick.category_label || '发现';
+  $('#pickTitle').textContent = pick.title || '';
+  $('#pickMeta').textContent = [pick.authors, pick.year || '', pick.venue]
+    .filter(Boolean).join(' · ');
+  $('#pickZh').textContent = pick.zh || '';
+  // 空串必须赋 ''，赋 ' ' 会让 CSS :empty 匹配不上，卡片里留一块空白
+  $('#pickWhy').textContent = pick.why ? `推荐理由：${pick.why}` : '';
+  pickState.id = pick.id;
+
+  const link = $('#pickLink');
+  const href = pick.link || '';
+  // 只放行 http(s)：外部来源给的地址不能直接塞进 href
+  if (/^https?:\/\//i.test(href)) { link.href = href; link.classList.remove('hidden'); }
+  else link.classList.add('hidden');
+}
+
+function renderPickNotice(title, note) {
+  $('#pickCat').textContent = '发现';
+  $('#pickTitle').textContent = title;
+  $('#pickMeta').textContent = '';
+  $('#pickZh').textContent = note;
+  $('#pickWhy').textContent = '';
+  $('#pickLink').classList.add('hidden');
+  pickState.id = null;
+}
+
+async function loadPick() {
+  if (!state.cfg.pick_enabled) return;
+  if (pickState.loading) return;
+  pickState.loading = true;
+  $('#pick').classList.remove('hidden');
+  try {
+    const d = await api('/api/picks/next');
+    if (d.pick) {
+      pickState.tries = 0;
+      renderPick(d.pick);
+    } else if (d.blocked) {
+      // 模型连续给不出能用的结果，后台已经进入冷却：这时重试也没用，
+      // 把恢复时间说清楚，别让人以为页面坏了
+      const min = Math.ceil(d.blocked / 60);
+      renderPickNotice('暂时没有推荐',
+        `挑论文的模型暂时不可用，约 ${min} 分钟后自动重试。`);
+    } else if (d.generating && pickState.tries < 12) {
+      // 后台正在生成（首次要十几秒），过几秒再问一次；最多等约一分钟
+      pickState.tries += 1;
+      renderPickNotice('正在挑论文…', '首次生成大约十几秒。');
+      clearTimeout(pickState.retry);
+      pickState.retry = setTimeout(loadPick, 6000);
+    } else {
+      renderPickNotice('暂时没有推荐', '取不到论文，稍后刷新页面再试试。');
+    }
+  } catch (err) {
+    renderPickNotice('暂时没有推荐', `取不到论文：${err.message}`);
+  } finally {
+    pickState.loading = false;
+  }
+}
+
+async function rerollPick() {
+  const btn = $('#pickReroll');
+  btn.disabled = true;
+  renderPickNotice('换一篇…', '正在重新挑。');
+  await loadPick();
+  btn.disabled = false;
+}
+
 /* ------------------------------------------------------------------ 事件 */
 function bind() {
   const drop = $('#drop');
@@ -864,6 +942,7 @@ function bind() {
 
   $('#glossaryBtn').onclick = showGlossary;
   $('#statsBtn').onclick = showStats;
+  $('#pickReroll').onclick = rerollPick;
   $('#modalClose').onclick = closeModal;
   $('#modal').onclick = (e) => { if (e.target.id === 'modal') closeModal(); };
 
@@ -993,4 +1072,5 @@ window.addEventListener('pagehide', purgeOnPageExit);   // 关闭标签页 / 关
   await loadConfig();
   await route();
   window.addEventListener('hashchange', route);
+  loadPick();   // 不 await：推荐是锦上添花，不该挡住书库渲染
 })();

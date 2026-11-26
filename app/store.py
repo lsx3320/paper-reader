@@ -49,6 +49,32 @@ CREATE TABLE IF NOT EXISTS glossary (
     note TEXT NOT NULL DEFAULT '',
     builtin INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS picks (
+    id          TEXT PRIMARY KEY,
+    oa_id       TEXT NOT NULL UNIQUE,
+    category    TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    authors     TEXT NOT NULL DEFAULT '',
+    year        INTEGER NOT NULL DEFAULT 0,
+    venue       TEXT NOT NULL DEFAULT '',
+    doi         TEXT NOT NULL DEFAULT '',
+    landing_url TEXT NOT NULL DEFAULT '',
+    pdf_url     TEXT NOT NULL DEFAULT '',
+    pdf_ok      INTEGER NOT NULL DEFAULT 0,
+    zh          TEXT NOT NULL DEFAULT '',
+    why         TEXT NOT NULL DEFAULT '',
+    prompt_ver  TEXT NOT NULL DEFAULT '',
+    used_at     REAL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_picks_unused ON picks(used_at, created_at);
+
+CREATE TABLE IF NOT EXISTS pick_docs (
+    pick_id    TEXT PRIMARY KEY,
+    doc_id     TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -247,6 +273,74 @@ class Store:
 
     def glossary_delete(self, en: str) -> None:
         self._execute("DELETE FROM glossary WHERE en=?", (en,))
+
+    # ------------------------------------------------------------------ 论文发现
+    @staticmethod
+    def _pick_row(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def pick_add(self, *, pick_id: str, oa_id: str, category: str, title: str,
+                 authors: str = "", year: int = 0, venue: str = "", doi: str = "",
+                 landing_url: str = "", pdf_url: str = "", pdf_ok: bool = False,
+                 zh: str = "", why: str = "", prompt_ver: str = "") -> bool:
+        """入库一条推荐；oa_id 已存在则跳过（返回 False，靠 UNIQUE 约束去重）。
+
+        有几列是 OpenAlex 时代的遗留，现在恒为空、没人读：oa_id 这个**列名**装的已是
+        标题哈希（见 discovery.title_key），doi / pdf_url / pdf_ok 则全部留空——
+        推荐现在只给一个链接，不再试下载 PDF。表没有迁移框架，加列改列都做不了，
+        所以旧列原样留着，约束和去重逻辑照旧。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO picks (id, oa_id, category, title, authors, year, venue,"
+                " doi, landing_url, pdf_url, pdf_ok, zh, why, prompt_ver, used_at, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
+                (pick_id, oa_id, category, title, authors, year, venue, doi,
+                 landing_url, pdf_url, 1 if pdf_ok else 0, zh, why, prompt_ver, _now()),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def pick_next(self) -> dict[str, Any] | None:
+        """取一篇没用过的并立刻标记为已用；池子空则返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM picks WHERE used_at IS NULL ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute("UPDATE picks SET used_at=? WHERE id=?", (_now(), row["id"]))
+            self._conn.commit()
+        return self._pick_row(row)
+
+    def pick_get(self, pick_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT * FROM picks WHERE id=?", (pick_id,))
+        return self._pick_row(row) if row else None
+
+    def pick_count_unused(self) -> int:
+        row = self._query_one("SELECT COUNT(*) AS n FROM picks WHERE used_at IS NULL")
+        return int(row["n"]) if row else 0
+
+    def pick_recent_titles(self, limit: int = 15) -> list[str]:
+        """最近生成过的标题，倒序。
+
+        拿给模型看——光靠 UNIQUE 约束只能挡住重复入库，挡不住模型每次都推同一批，
+        池子会一直补不进新东西。
+        """
+        rows = self._query("SELECT title FROM picks ORDER BY created_at DESC LIMIT ?", (limit,))
+        return [r["title"] for r in rows]
+
+    def pick_purge_versions(self, keep: str) -> int:
+        """提示词版本变了就清空旧池子，否则改完 prompt 看不到任何变化。"""
+        cur = self._execute("DELETE FROM picks WHERE prompt_ver!=?", (keep,))
+        return cur.rowcount if cur.rowcount > 0 else 0
+
+    def pick_prune(self, keep: int = 200) -> int:
+        """表体积兜底：只保留最近 keep 条，多余的旧记录删掉。"""
+        cur = self._execute(
+            "DELETE FROM picks WHERE id NOT IN (SELECT id FROM picks ORDER BY created_at DESC LIMIT ?)",
+            (max(10, keep),))
+        return cur.rowcount if cur.rowcount > 0 else 0
 
 
 def cache_key(text: str, variant: str = "") -> str:

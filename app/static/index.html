@@ -25,6 +25,22 @@
 
   <div id="llmWarn" class="warn hidden"></div>
 
+  <!-- 论文推荐：后台预先让模型挑好，刷新即出；点链接去原站看 -->
+  <section id="pick" class="pick hidden">
+    <header class="pick-head">
+      <span class="chip" id="pickCat">发现</span>
+      <span class="pick-src">模型推荐</span>
+      <button class="btn ghost" id="pickReroll">换一篇</button>
+    </header>
+    <h2 class="pick-title" id="pickTitle"></h2>
+    <p class="pick-meta" id="pickMeta"></p>
+    <p class="pick-zh" id="pickZh"></p>
+    <p class="pick-why" id="pickWhy"></p>
+    <div class="pick-actions">
+      <a class="btn primary" id="pickLink" target="_blank" rel="noopener">去原站阅读</a>
+    </div>
+  </section>
+
   <label id="drop" class="drop">
     <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
     <strong>拖入 PDF 或点击选择文件</strong>
