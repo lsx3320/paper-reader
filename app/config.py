@@ -7,7 +7,11 @@ from functools import lru_cache
 from pathlib import Path
 
 # 提示词版本号：修改提示词后 +1，可让翻译缓存自动失效
-PROMPT_VERSION = "v3"
+# v4：改为「科普改写」风格（面向无专业背景读者重建逻辑），旧译文不再复用
+PROMPT_VERSION = "v4"
+
+# 挑选提示词版本号：修改后 +1，可让已生成的推荐池失效重来
+PICK_PROMPT_VERSION = "v1"
 
 # 内置学术术语表（可在界面中增删改）
 DEFAULT_GLOSSARY: list[tuple[str, str]] = [
@@ -155,7 +159,17 @@ class Settings:
     tts_concurrency: int
     tts_chunk_chars: int
     tts_cache_max_mb: int
-    app_password: str
+    tts_fatal_cooldown: float
+
+    # 论文发现（让模型推荐论文 → 卡片展示，不含下载）
+    pick_enabled: bool
+    pick_batch: int
+    pick_temperature: float
+    pick_pool_min: int
+    pick_pool_max: int
+    pick_refresh_sec: float
+    pick_purge_versions: bool
+    pick_prompt_ver: str
 
     default_glossary: list[tuple[str, str]] = field(default_factory=lambda: list(DEFAULT_GLOSSARY))
 
@@ -186,6 +200,9 @@ class Settings:
             "tts_voice": self.tts_voice,
             "tts_cache_on_shutdown": self.tts_cache_on_shutdown,
             "max_upload_mb": self.max_upload_mb,
+            # 和 Recommender.start() 的开关保持一致：没有可用模型时后台根本不会生成，
+            # 只报 pick_enabled 的话前端会一直转「正在挑论文…」
+            "pick_enabled": self.pick_enabled and self.llm_ready,
         }
 
 
@@ -235,6 +252,20 @@ def get_settings() -> Settings:
         tts_chunk_chars=max(60, _env_int("TTS_CHUNK_CHARS", 180)),
         # 语音缓存容量上限（MB）：超出后按最久未使用淘汰；0 表示不限制
         tts_cache_max_mb=max(0, _env_int("TTS_CACHE_MAX_MB", 500)),
-        # 访问口令：设置后整个站点需要登录（公网暴露时必填）
-        app_password=_env("APP_PASSWORD") or _env("PAPER_PASSWORD") or "",
+        # 账户级故障（余额不足 / Key 失效）后的熔断冷却秒数：期间朗读直接返回明确原因，
+        # 不再逐次空打接口；设 0 关闭熔断（每次都真打接口）
+        tts_fatal_cooldown=max(0.0, _env_float("TTS_FATAL_COOLDOWN", 120.0)),
+        # 论文发现：让模型直接推荐论文并写中文概括（不含下载，链接交给用户自己点）
+        pick_enabled=_env_bool("PICK_ENABLED", True),
+        # 一次让模型推荐几篇。批量要一次比一篇篇要省 token，但太多会摊薄质量
+        pick_batch=min(8, max(1, _env_int("PICK_BATCH", 3))),
+        # 推荐任务的温度。比翻译低、比判断高——要的是多样性，
+        # 但太高会让它开始编造论文标题和链接
+        pick_temperature=_env_float("PICK_TEMPERATURE", 0.9),
+        pick_pool_min=max(1, _env_int("PICK_POOL_MIN", 3)),
+        pick_pool_max=max(2, _env_int("PICK_POOL_MAX", 8)),
+        # 后台巡检间隔（秒）：池子见底时自动补，平时空转
+        pick_refresh_sec=max(60.0, _env_float("PICK_REFRESH_SEC", 1800.0)),
+        pick_purge_versions=_env_bool("PICK_PURGE_VERSIONS", True),
+        pick_prompt_ver=PICK_PROMPT_VERSION,
     )

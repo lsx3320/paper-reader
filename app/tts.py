@@ -14,14 +14,49 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import logging
 import re
+import time
 import wave
 from pathlib import Path
 
 import httpx
 
 log = logging.getLogger("tts")
+
+# 账户级错误：重试没有意义（余额不足、Key 失效、被风控），短时间内直接短路，
+# 避免用户每点一次朗读都白打一轮接口再等一串超时。
+FATAL_STATUSES = frozenset({401, 402, 403})
+
+
+def friendly_http_error(status: int, body: str) -> str:
+    """把 MiMo 的英文原始报错翻成「能直接照做」的中文提示。"""
+    code = message = ""
+    try:
+        err = (json.loads(body) or {}).get("error") or {}
+        code = str(err.get("code") or "")
+        message = str(err.get("message") or "")
+    except (ValueError, TypeError, AttributeError):
+        pass
+    low = f"{code} {message} {body}".lower()
+
+    if status == 401:
+        return ("语音服务鉴权失败（HTTP 401）：TTS_API_KEY 无效或已失效，"
+                "请到小米 MiMo 开放平台重新生成后更新 .env")
+    if status == 403:
+        return ("语音服务被拒绝（HTTP 403）：当前地区不可用，或该 API Key 已被风控限制")
+    if status == 402 or "insufficient" in low or "balance" in low:
+        # 这是本站踩过的最坑的一个坑：TTS 模型本身「限时免费」，但计费系统上线后，
+        # 账户余额 ≤ 0 会被网关拦在模型计价之前，免费模型照样吃 402。
+        return ("语音账户余额不足（HTTP 402）：TTS 模型 mimo-v2.5-tts 本身限时免费，"
+                "但余额 ≤ 0 时平台会停用整个推理服务（免费模型也一样）。"
+                "请到 mimo.mi.com → 账户余额 领取免费额度或充值任意金额后重试")
+    if status == 429:
+        return "语音服务限流（HTTP 429）：请求过于频繁，请稍后重试"
+    if status >= 500:
+        return f"语音服务端故障（HTTP {status}）：小米 MiMo 接口临时不可用，请稍后重试"
+    return f"语音合成失败（HTTP {status}）：{message or body[:160]}"
 
 # 官方内置音色（mimo-v2.5-tts 只支持内置音色）
 VOICES: list[dict[str, str]] = [
@@ -59,7 +94,17 @@ SYMBOL_MAP = {
 
 
 class SpeechError(RuntimeError):
-    pass
+    """语音合成失败。
+
+    `fatal=True` 表示账户级故障（余额不足 / Key 失效 / 被风控）——重试无用，
+    调用方应转成 503 并把原因原样告诉用户，而不是笼统的 502。
+    """
+
+    def __init__(self, message: str, *, fatal: bool = False,
+                 status: int | None = None) -> None:
+        super().__init__(message)
+        self.fatal = fatal
+        self.status = status
 
 
 def clean_for_speech(text: str) -> str:
@@ -160,7 +205,7 @@ class Synthesizer:
     def __init__(self, api_key: str, base_url: str, model: str, voice: str,
                  audio_format: str, timeout: float, cache_dir: Path,
                  max_chunk: int = 180, concurrency: int = 4,
-                 cache_max_mb: int = 500) -> None:
+                 cache_max_mb: int = 500, fatal_cooldown: float = 120.0) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -175,11 +220,86 @@ class Synthesizer:
         self._client: httpx.AsyncClient | None = None
         self.stats = {"requests": 0, "chars": 0, "cache_hits": 0, "errors": 0}
         self.cache_max_mb = max(0, int(cache_max_mb))
+        # 熔断状态：账户级故障（余额不足等）后冷却期内不再请求，直接把原因抛给用户
+        self.fatal_cooldown = max(0.0, float(fatal_cooldown))
+        self._fatal_until = 0.0
+        self._fatal_message = ""
+        self._fatal_status: int | None = None
+        self._fatal_seen_at: float | None = None
+        # 主动探测结果缓存：(过期时刻, 结果)
+        self._probe_cache: tuple[float, dict] | None = None
         self._evict()   # 启动时先按上限收敛一次
 
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
+
+    # ------------------------------------------------------------ 熔断 / 健康
+    @property
+    def fatal_active(self) -> bool:
+        """账户级故障冷却中：此时请求必定失败，不必再打接口。"""
+        return time.monotonic() < self._fatal_until
+
+    def _mark_fatal(self, message: str, status: int | None = None) -> None:
+        self._fatal_until = time.monotonic() + self.fatal_cooldown
+        self._fatal_message = message
+        self._fatal_status = status
+        self._fatal_seen_at = time.time()
+        log.error("语音服务熔断 %.0fs（账户级故障，期间不再请求接口）：%s",
+                  self.fatal_cooldown, message)
+
+    def clear_fatal(self) -> None:
+        if self._fatal_message:
+            log.info("语音服务已恢复，熔断解除")
+        self._fatal_until = 0.0
+        self._fatal_message = ""
+        self._fatal_status = None
+        self._fatal_seen_at = None
+
+    def _fatal_error(self) -> SpeechError:
+        """熔断期内的短路异常：必须保留 fatal 标记，否则调用方会误判成可重试的 502。"""
+        return SpeechError(self._fatal_message, fatal=True, status=self._fatal_status)
+
+    def health(self) -> dict:
+        """被动健康状态：不产生任何请求，只反映最近一次真实调用的结论。"""
+        if not self.api_key:
+            return {"ready": False, "status": "unconfigured",
+                    "error": "未配置 TTS_API_KEY，朗读功能不可用", "checked_at": None}
+        if self.fatal_active:
+            return {"ready": False, "status": "error", "error": self._fatal_message,
+                    "checked_at": self._fatal_seen_at,
+                    "retry_after": round(max(0.0, self._fatal_until - time.monotonic()), 1)}
+        if self._fatal_seen_at is not None:
+            return {"ready": True, "status": "recovered", "error": None,
+                    "checked_at": self._fatal_seen_at}
+        if self.stats["requests"] == 0:
+            return {"ready": True, "status": "unverified", "error": None,
+                    "checked_at": None}
+        return {"ready": True, "status": "ok", "error": None, "checked_at": None}
+
+    async def probe(self, ttl: float = 300.0) -> dict:
+        """真实探测一次 TTS 可用性（带 TTL 缓存，避免频繁打扰接口）。
+
+        这是唯一能确认「账户余额 / Key / 音色」都正常的办法——`enabled` 只看
+        Key 是否非空，余额不足时它会撒谎说一切正常。
+        """
+        now = time.monotonic()
+        if self._probe_cache is not None and now < self._probe_cache[0]:
+            return self._probe_cache[1]
+
+        if not self.api_key:
+            result = {"ready": False, "status": "unconfigured",
+                      "error": "未配置 TTS_API_KEY，朗读功能不可用"}
+        else:
+            self.clear_fatal()          # 探测本身就是一次复审，先摘掉熔断
+            try:
+                await self._request("测试。", self.voice, retries=0)
+                result = {"ready": True, "status": "ok", "error": None}
+            except SpeechError as exc:
+                result = {"ready": False, "status": "error", "error": str(exc)}
+        result = {**result, "checked_at": time.time(), "model": self.model, "voice": self.voice}
+        self._probe_cache = (now + max(0.0, ttl), result)
+        return result
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -212,6 +332,11 @@ class Synthesizer:
         if path.is_file() and path.stat().st_size > 1024:
             self.stats["cache_hits"] += 1
             return path.read_bytes(), True
+
+        # 熔断检查放在缓存之后：账户欠费时已合成过的段落仍能正常回放，
+        # 只有需要新合成的段落才会立刻拿到明确原因，而不是干等一轮超时。
+        if self.fatal_active:
+            raise self._fatal_error()
 
         # 分片并行合成：实测接口无并发限制（6 路并发同样 6.7~8.8s 全部返回），
         # 因此长段落切成多片同时合成，墙钟时间从"线性累加"变成"最慢那一片"。
@@ -301,20 +426,29 @@ class Synthesizer:
                 await asyncio.sleep(0.6 * (attempt + 1))
                 continue
             if resp.status_code < 400:
+                self.clear_fatal()
                 break
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries:
                 log.warning("语音合成临时失败 HTTP %s，%.1fs 后重试", resp.status_code, 0.8 * (attempt + 1))
                 await asyncio.sleep(0.8 * (attempt + 1))
                 continue
             self.stats["errors"] += 1
-            raise SpeechError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            friendly = friendly_http_error(resp.status_code, resp.text)
+            is_fatal = resp.status_code in FATAL_STATUSES
+            if is_fatal:
+                # 账户级故障：记下来并对后续请求短路，别让用户每点一次都白等
+                self._mark_fatal(friendly, resp.status_code)
+            raise SpeechError(friendly, fatal=is_fatal, status=resp.status_code)
         assert resp is not None
         try:
             data = resp.json()
             b64 = data["choices"][0]["message"]["audio"]["data"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             self.stats["errors"] += 1
-            raise SpeechError(f"响应解析失败：{resp.text[:200]}") from exc
+            raise SpeechError(
+                "响应解析失败：接口没有返回 choices[0].message.audio.data，"
+                f"可能是模型或网关不兼容（当前 TTS_MODEL={self.model}）。原始响应：{resp.text[:200]}"
+            ) from exc
         raw = base64.b64decode(b64)
         if not raw:
             self.stats["errors"] += 1

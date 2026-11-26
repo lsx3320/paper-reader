@@ -12,12 +12,12 @@ from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, RedirectResponse, Response, StreamingResponse)
+                               PlainTextResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from .auth import AuthMiddleware, COOKIE_NAME, SESSION_TTL, login_page, make_token
 from .config import Settings, get_settings
+from .discovery import CATEGORY_LABELS, Recommender
 from .pdf_parser import parse_pdf
 from .protect import glossary_fingerprint
 from .store import Store, cache_key
@@ -44,11 +44,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                       cache_dir=settings.tts_dir,
                       max_chunk=settings.tts_chunk_chars,
                       concurrency=settings.tts_concurrency,
-                      cache_max_mb=settings.tts_cache_max_mb)
+                      cache_max_mb=settings.tts_cache_max_mb,
+                      fatal_cooldown=settings.tts_fatal_cooldown)
     app.state.settings = settings
     app.state.store = store
     app.state.translator = translator
     app.state.tts = tts
+    picker = Recommender(settings, store, translator)
+    app.state.picker = picker
+    await picker.start()
     log.info("启动完成：模型=%s mock=%s 数据目录=%s",
              settings.model, settings.mock, settings.data_dir)
     try:
@@ -64,38 +68,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     pass
             if freed:
                 log.info("服务退出，已清理语音缓存：释放 %.1f MB", freed / 1048576)
+        await picker.aclose()
         await translator.aclose()
         await tts.aclose()
         store.close()
 
 
 app = FastAPI(title="Paper Reader · 论文双语阅读器", version="1.0.0", lifespan=lifespan)
-app.add_middleware(AuthMiddleware, password=get_settings().app_password)
-
-
-@app.get("/login")
-async def login_form(request: Request) -> HTMLResponse:
-    """登录页（未设置 APP_PASSWORD 时直接放行）。"""
-    if not get_settings().app_password:
-        return RedirectResponse("/", status_code=302)
-    return login_page(next_url=request.query_params.get("next", "/"))
-
-
-@app.post("/login")
-async def login_submit(request: Request) -> Response:
-    """校验口令并下发签名 Cookie。"""
-    password = get_settings().app_password
-    form = await request.form()
-    nxt = str(form.get("next") or "/")
-    if not nxt.startswith("/"):
-        nxt = "/"
-    if password and str(form.get("password") or "").strip() == password:
-        resp = RedirectResponse(nxt, status_code=303)
-        resp.set_cookie(COOKIE_NAME, make_token(password), max_age=SESSION_TTL,
-                        httponly=True, samesite="lax", secure=request.url.scheme == "https")
-        log.info("登录成功：%s", request.client.host if request.client else "?")
-        return resp
-    return login_page(error=True, next_url=nxt)
 
 
 def S() -> Settings:
@@ -112,6 +91,10 @@ def TR() -> Translator:
 
 def TTS_ENGINE() -> Synthesizer:
     return app.state.tts
+
+
+def PICKER() -> Recommender:
+    return app.state.picker
 
 
 def variant_key() -> str:
@@ -151,9 +134,22 @@ def sse(event: str, data: dict[str, Any]) -> str:
 
 # --------------------------------------------------------------------- 基础接口
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
+async def health(probe: int = Query(0, description="1 = 顺带真实探测一次 TTS 可用性")) -> dict[str, Any]:
+    """健康检查。
+
+    注意 `config.tts_ready` 只代表「配了 API Key」，不代表能用——余额不足时它照样是
+    true。想知道朗读到底能不能用，看 `tts.ready`，或者带 `?probe=1` 真打一次接口。
+    """
     s = S()
-    return {"ok": True, "llm_ready": s.llm_ready, "config": s.public()}
+    engine = TTS_ENGINE()
+    tts_state = await engine.probe() if probe else engine.health()
+    return {
+        "ok": True,
+        "llm_ready": s.llm_ready,
+        "tts_ready": tts_state["ready"],      # 真实状态（含熔断），别再只看 Key 是否非空
+        "tts": tts_state,
+        "config": s.public(),
+    }
 
 
 @app.get("/api/stats")
@@ -205,6 +201,16 @@ async def upload_doc(file: UploadFile = File(...)) -> dict[str, Any]:
     finally:
         await file.close()
 
+    return await _ingest_pdf(dest, name)
+
+
+async def _ingest_pdf(dest: Path, name: str) -> dict[str, Any]:
+    """把已经落盘的 PDF 解析入库。手动上传和「翻译这篇」共用这一条路径。
+
+    doc_id 直接取文件名主干，保证和 dest 的命名约定（{doc_id}.pdf）一致。
+    """
+    s = S()
+    doc_id = dest.stem
     try:
         parsed = await run_in_threadpool(parse_pdf, dest, s.max_chars, s.translate_refs)
     except Exception as exc:  # noqa: BLE001
@@ -427,11 +433,42 @@ async def translate_one(doc_id: str, idx: int, force: bool = Query(True)) -> dic
 
 
 # --------------------------------------------------------------------- 语音合成
+def _speech_http_error(exc: SpeechError) -> HTTPException:
+    """SpeechError → HTTPException。
+
+    账户级故障（余额不足 / Key 失效）映射成 503 而非 502：这不是「网关抽风」，
+    重试无用，得让用户看到原因并去处理，所以带上中文说明和恢复提示。
+    """
+    if getattr(exc, "fatal", False):
+        return HTTPException(503, str(exc), headers={"Retry-After": "60"})
+    return HTTPException(502, f"语音合成失败：{exc}")
+
+
 @app.get("/api/tts/config")
 async def tts_config() -> dict[str, Any]:
     s = S()
     return {"ready": s.tts_ready, "model": s.tts_model, "voice": s.tts_voice,
-            "format": s.tts_format, "voices": VOICES}
+            "format": s.tts_format, "voices": VOICES, "health": TTS_ENGINE().health()}
+
+
+@app.get("/api/tts/probe")
+async def tts_probe(force: int = Query(0, description="1 = 忽略缓存，立刻真打一次接口")) -> dict[str, Any]:
+    """真实探测 TTS 是否可用。
+
+    `tts_ready` 只看 Key 是否非空，余额不足时会产生「显示正常、一点就报错」的假象，
+    这个接口真发一次极短请求（TTS 限时免费，成本可忽略）来给准话。
+    """
+    engine = TTS_ENGINE()
+    if force:
+        engine._probe_cache = None      # noqa: SLF001 强制复审
+    state = await engine.probe()
+    if state["ready"]:
+        state["suggestion"] = None
+    elif state["status"] == "unconfigured":
+        state["suggestion"] = "在 .env 里设置 TTS_API_KEY 后重启服务"
+    else:
+        state["suggestion"] = "先到 mimo.mi.com → 账户余额 领取免费额度或充值，再回来重试"
+    return state
 
 
 @app.post("/api/tts")
@@ -448,7 +485,7 @@ async def tts_speak(payload: dict[str, Any]) -> Response:
     try:
         data, cached = await engine.synthesize(text, payload.get("voice"))
     except SpeechError as exc:
-        raise HTTPException(502, f"语音合成失败：{exc}") from exc
+        raise _speech_http_error(exc) from exc
     media = "audio/wav" if engine.audio_format == "wav" else f"audio/{engine.audio_format}"
     return Response(content=data, media_type=media,
                     headers={"X-TTS-Cached": "1" if cached else "0",
@@ -472,7 +509,7 @@ async def tts_block(doc_id: str, idx: int, voice: str | None = Query(None)) -> R
     try:
         data, cached = await engine.synthesize(text, voice)
     except SpeechError as exc:
-        raise HTTPException(502, f"语音合成失败：{exc}") from exc
+        raise _speech_http_error(exc) from exc
     media = "audio/wav" if engine.audio_format == "wav" else f"audio/{engine.audio_format}"
     return Response(content=data, media_type=media,
                     headers={"X-TTS-Cached": "1" if cached else "0"})
@@ -621,18 +658,74 @@ async def del_glossary(en: str) -> dict[str, Any]:
     return {"ok": True, "terms": DB().glossary_all()}
 
 
+# --------------------------------------------------------------------- 论文发现
+def _pick_payload(p: dict[str, Any]) -> dict[str, Any]:
+    """对外的推荐结构，不带 prompt_ver / used_at 这些内部字段。
+
+    只给链接，不给下载：模型给的多是 DOI 落地页，代码这边判断不了能不能下到 PDF，
+    与其猜，不如把链接交给用户自己在浏览器里点。
+    """
+    return {
+        "id": p["id"],
+        "category": p["category"],
+        "category_label": CATEGORY_LABELS.get(p["category"], p["category"]),
+        "title": p["title"],
+        "authors": p["authors"],
+        "year": p["year"],
+        "venue": p["venue"],
+        "link": p["landing_url"],
+        "zh": p["zh"],
+        "why": p["why"],
+    }
+
+
+@app.get("/api/picks/next")
+async def next_pick() -> JSONResponse:
+    """取一篇推荐。池子空时触发后台补充并返回 generating=true。
+
+    必须带 Cache-Control: no-store —— 前端用的是裸 fetch，不加会被浏览器缓存，刷新就不换。
+    """
+    s = S()
+    headers = {"Cache-Control": "no-store"}
+    if not s.pick_enabled or not s.llm_ready:
+        return JSONResponse({"pick": None, "enabled": False, "generating": False},
+                            headers=headers)
+    picker = PICKER()
+    pick = await picker.next_pick()
+    if not picker.available:
+        # 推荐功能自己坏了（比如池子读不出来）：明说关掉，别让前端一直转圈等
+        return JSONResponse({"pick": None, "enabled": False, "generating": False},
+                            headers=headers)
+    blocked = int(picker.blocked_for)
+    return JSONResponse(
+        {"pick": _pick_payload(pick) if pick else None,
+         "enabled": True,
+         # 冷却中时 generating 为假：后台压根不会去补，前端不该再转圈等
+         "generating": pick is None and not blocked,
+         "blocked": blocked},
+        headers=headers)
+
+
 # --------------------------------------------------------------------- 前端
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# 外壳 HTML 绝不能缓存：它没有 ETag/Last-Modified，浏览器和 Cloudflare 边缘节点
+# 拿到之后会一直用旧的，结果是代码更新了、页面还是老样子（踩过）。
+# /static/*.js 和 .css 由 StaticFiles 提供，自带 ETag 会正常协商，不用管。
+_NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
 
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/read/{doc_id}", response_class=HTMLResponse)
 async def index(doc_id: str | None = None) -> HTMLResponse:
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+                        headers=_NO_STORE)
 
 
 @app.exception_handler(404)
 async def not_found(request: Request, exc: Exception) -> JSONResponse:
     if request.url.path.startswith("/api/"):
         return JSONResponse({"detail": "接口不存在"}, status_code=404)
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"), status_code=200)
+    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+                        status_code=200, headers=_NO_STORE)

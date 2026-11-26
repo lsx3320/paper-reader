@@ -16,7 +16,10 @@ services:
       DATA_DIR: /data
       TZ: Asia/Shanghai
     volumes:
-      - ./data:/data
+      # 数据目录刻意放在项目之外：SQLite 的 db/-wal/-shm 三件套必须同生共死，
+      # 而项目目录在 ~/Desktop 下，容易被同步/备份工具或手动清理碰到——2026-09-20
+      # 的数据库损坏与 2026-10-08 的 WAL 丢失都源于此。可用 DATA_HOST_DIR 覆盖。
+      - "${DATA_HOST_DIR:-/Users/Zhuanz1/paper-reader-data}:/data"
     # Linux 上访问宿主机上的本地模型服务（macOS/Windows 自带，加了也无害）
     extra_hosts:
       - "host.docker.internal:host-gateway"
